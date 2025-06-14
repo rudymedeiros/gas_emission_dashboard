@@ -32,29 +32,49 @@ df = pd.read_csv ('smart_manufacturing_data.csv')
 #         Imputação
 #------------------------------
 
-numeric_cols = ['temperature', 'vibration',  'pressure', 'energy_consumption', 'predicted_remaining_life', 'downtime_risk']
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+# 1. Imputação para colunas numéricas
+numeric_cols = ['temperature', 'vibration', 'humidity', 'pressure', 'energy_consumption', 'predicted_remaining_life', 'downtime_risk']
 for col in numeric_cols:
     if col in df.columns:
-        df[col] = df[col].fillna(df[col].mean())
+        # Preenche com a mediana (menos sensível a outliers) agrupada por máquina
+        df[col] = df.groupby('machine')[col].transform(lambda x: x.fillna(x.median()))
+        # Se ainda houver NAs (caso toda o grupo seja NA), preenche com a mediana global
+        df[col] = df[col].fillna(df[col].median())
 
-categorical_cols = ['failure_type', 'downtime_risk', 'maintenance_required']
+# 2. Imputação para colunas categóricas
+categorical_cols = ['failure_type', 'maintenance_required', 'anomaly_flag', 'machine_status']
 for col in categorical_cols:
     if col in df.columns:
-        df[col] = df[col].fillna(df[col].mode()[0])
+        # Preenche com a moda agrupada por máquina
+        df[col] = df.groupby('machine')[col].transform(lambda x: x.fillna(x.mode()[0] if not x.mode().empty else 'Unknown'))
+        # Preenche quaisquer valores restantes com 'Unknown'
+        df[col] = df[col].fillna('Unknown')
 
-condition = (df['machine_status'].isnull()) & (df['anomaly_flag'] == 'Yes') & (df['maintenance_required'] == 'Yes')
-df.loc[condition, 'machine_status'] = 'Failure'
+# 3. Imputação inteligente do machine_status baseado em outras variáveis
+# Primeiro cria uma máscara para os status ainda faltantes
+missing_status = df['machine_status'].isna()
 
+# Regra 1: Se anomaly_flag é 'Yes' e maintenance_required é 'Yes', provavelmente é 'Failure'
+df.loc[missing_status & (df['anomaly_flag'] == 'Yes') & (df['maintenance_required'] == 'Yes'), 'machine_status'] = 'Failure'
+
+# Regra 2: Valores extremos de vibração e temperatura indicam 'Warning'
 vibration_threshold = df['vibration'].quantile(0.9)
 temp_threshold = df['temperature'].quantile(0.9)
-condition = (df['machine_status'].isnull()) & (df['vibration'] > vibration_threshold) & (df['temperature'] > temp_threshold)
-df.loc[condition, 'machine_status'] = 'Warning'
+df.loc[missing_status & 
+       (df['vibration'] > vibration_threshold) & 
+       (df['temperature'] > temp_threshold), 'machine_status'] = 'Warning'
 
-for machine in df['machine'].unique():
-    machine_mask = (df['machine'] == machine) & (df['machine_status'].isnull())
+# Regra 3: Para os demais casos, usa o status mais comum daquela máquina
+for machine in df[df['machine_status'].isna()]['machine'].unique():
     most_common = df[df['machine'] == machine]['machine_status'].mode()
     if not most_common.empty:
-        df.loc[machine_mask, 'machine_status'] = most_common[0]
+        df.loc[(df['machine'] == machine) & (df['machine_status'].isna()), 'machine_status'] = most_common[0]
+
+# Regra 4: Qualquer valor ainda faltante recebe 'Running' como padrão
+df['machine_status'] = df['machine_status'].fillna('Running')
+
 
 # ================================
 # Barra Lateral - Filtros Globais
@@ -146,9 +166,16 @@ with tab2:
     st.header("Análise de Manutenção e Anomalias")
 
     # Gráfico 4: Máquinas que Precisam de Manutenção
-    maintenance_needed = filtered_df[filtered_df['maintenance_required'] == 'Yes']
-    machines_needing_maintenance = maintenance_needed['machine'].nunique()
-    st.metric("Máquinas Precisando de Manutenção", machines_needing_maintenance)
+
+    last_status_per_machine = filtered_df.sort_values('timestamp').groupby('machine').last()
+    current_maintenance_needed = last_status_per_machine[last_status_per_machine['maintenance_required'] == 'Yes']
+    machines_needing_maintenance = current_maintenance_needed.shape[0]
+    st.metric("Máquinas Atualmente Precisando de Manutenção", machines_needing_maintenance)
+    if not current_maintenance_needed.empty:
+        st.write("**Máquinas com manutenção pendente:**")
+        st.dataframe(current_maintenance_needed[['machine_status', 'failure_type', 'predicted_remaining_life']])
+    else:
+        st.success("Nenhuma máquina requer manutenção atualmente!")
 
     # Gráfico 5: Anomalias por Tipo de Falha (excluindo 'Operação Normal')
     falhas_df = filtered_df[filtered_df['failure_type'] != 'Normal']
@@ -172,14 +199,61 @@ with tab2:
 # ===================================
 with tab3:
     st.header("Análise de Riscos e Vida Útil")
-
-    # Gráfico 7: Distribuição de Downtime Risk (Histograma + KDE)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    sns.histplot(filtered_df['downtime_risk'].dropna(), bins=30, kde=True, color='purple', ax=ax)
-    ax.set_title("Distribuição de Downtime Risk")
-    ax.set_xlabel("Downtime Risk")
-    ax.set_ylabel("Frequência")
-    st.pyplot(fig)
+    
+    # Seção melhorada de Downtime Risk
+    st.subheader("Análise de Downtime Risk")
+    
+    # 1. Métricas-chave
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Média Downtime Risk", f"{filtered_df['downtime_risk'].mean():.2f}")
+    col2.metric("Máximo Downtime Risk", f"{filtered_df['downtime_risk'].max():.2f}")
+    col3.metric("Máquinas em Alto Risco", 
+                f"{(filtered_df['downtime_risk'] > 0.7).sum()} ({(filtered_df['downtime_risk'] > 0.7).mean()*100:.1f}%)")
+    
+    # 2. Visualização adaptativa
+    tab_risk1, tab_risk2, tab_risk3 = st.tabs(["Distribuição", "Por Máquina", "Tendência Temporal"])
+    
+    with tab_risk1:
+        # Gráfico de distribuição melhorado
+        fig = plt.figure(figsize=(10, 6))
+        
+        # Usamos bins especiais para destacar 0, 1 e valores intermediários
+        bins = [-0.05, 0.01, 0.2, 0.4, 0.6, 0.8, 0.99, 1.01]
+        plt.hist(filtered_df['downtime_risk'], bins=bins, edgecolor='black', alpha=0.7)
+        
+        plt.title("Distribuição de Downtime Risk (Bins Especiais)")
+        plt.xlabel("Nível de Risco")
+        plt.ylabel("Frequência")
+        plt.xticks([0, 0.5, 1], ['0 (Baixo)', '0.5 (Médio)', '1 (Alto)'])
+        st.pyplot(fig)
+        
+        st.caption("""
+        **Interpretação:**  
+        - Valores próximos a 0: Risco mínimo de parada  
+        - Valores próximos a 1: Alto risco de parada  
+        - Distribuição bimodal sugere classificações binárias
+        """)
+    
+    with tab_risk2:
+        # Top 10 máquinas com maior risco
+        high_risk = filtered_df.groupby('machine')['downtime_risk'].max().nlargest(10)
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        high_risk.sort_values().plot(kind='barh', color='coral', ax=ax)
+        plt.title("Top 10 Máquinas com Maior Downtime Risk")
+        plt.xlabel("Máximo Downtime Risk")
+        plt.ylabel("Máquina")
+        st.pyplot(fig)
+    
+    with tab_risk3:
+        # Tendência temporal (apenas se o filtro cobrir múltiplas datas)
+        if filtered_df['timestamp'].nunique() > 1:
+            fig = px.line(filtered_df.groupby(pd.Grouper(key='timestamp', freq='D'))['downtime_risk'].mean(),
+                         title="Evolução Diária do Downtime Risk Médio",
+                         labels={'value': 'Downtime Risk Médio', 'timestamp': 'Data'})
+            st.plotly_chart(fig)
+        else:
+            st.warning("Selecione um intervalo de tempo maior para visualizar a tendência temporal")
 
     # Gráfico 8: Predicted Remaining Life por Máquina
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -201,7 +275,8 @@ with tab3:
     sns.scatterplot(data=filtered_df, x='temperature', y='vibration', hue='machine_status', ax=ax)
     ax.set_title("Temperatura vs Vibração")
     st.pyplot(fig)
-
+    
+    
 # ===================================
 # Nova Página: Dados + Download
 # ===================================
